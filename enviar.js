@@ -186,8 +186,13 @@ function hoyIso() {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+/**
+ * Agrega una fila a `envios`. resultado: enviado | no_existe |
+ * conversacion_previa | duplicado | salteado | error | simulado.
+ * Devuelve el id de la fila, para poder completarla despues (ver actualizarMotivo).
+ */
 function registrar(db, negocio, numero, jid, resultado, motivo, msgId) {
-  db.prepare(
+  const { lastInsertRowid } = db.prepare(
     "INSERT INTO envios(negocio_id, numero, jid, resultado, motivo, fecha, msg_id) VALUES(?,?,?,?,?,?,?)"
   ).run(
     negocio ? negocio.id : null,
@@ -198,6 +203,11 @@ function registrar(db, negocio, numero, jid, resultado, motivo, msgId) {
     hoyIso(),
     msgId || null
   );
+  return lastInsertRowid;
+}
+
+function actualizarMotivo(db, envioId, motivo) {
+  db.prepare("UPDATE envios SET motivo=? WHERE id=?").run(motivo, envioId);
 }
 
 function marcarContactado(db, negocio) {
@@ -227,6 +237,8 @@ function guardarChat(db, chat, origen) {
   );
 }
 
+// Baileys entrega los timestamps como number, bigint o Long (protobuf).
+// Devuelve segundos como number, o null si no se puede leer.
 function tsNum(v) {
   if (v === null || v === undefined) return null;
   if (typeof v === "number") return Math.trunc(v);
@@ -253,11 +265,14 @@ function normalizar(bruto) {
   let d = soloDigitos(bruto);
   if (!d) return null;
   if (d.startsWith("0054")) d = d.slice(4);
-  if (d.startsWith("54")) d = d.slice(2);
-  if (d.startsWith("0")) d = d.slice(1);
-  if (d.length === 11 && d.startsWith("9")) d = d.slice(1);
+  // Solo es codigo de pais si sobra largo: un 10 digitos que empieza con 54 no lo tiene.
+  else if (d.startsWith("54") && d.length > 10) d = d.slice(2);
+  if (d.startsWith("0")) d = d.slice(1); // 011... -> 11...
+  if (d.length === 11 && d.startsWith("9")) d = d.slice(1); // 9 11 XXXX XXXX -> 11 XXXX XXXX
+  // 11 15 XXXX XXXX -> 11 XXXX XXXX (el 15 es el prefijo local de celular)
   if (d.length === 12 && d.startsWith("11") && d.slice(2, 4) === "15") d = d.slice(0, 2) + d.slice(4);
   if (d.length !== 10 || !d.startsWith("11")) return null;
+  // WhatsApp identifica los celulares argentinos como 549 + area + numero.
   return { num: "549" + d, ult8: d.slice(2) };
 }
 
@@ -517,12 +532,17 @@ function guardarQr(qr) {
     console.log(`\nAbriendo el QR en el navegador: ${url}`);
     console.log(`PNG de respaldo: ${path.join(os.tmpdir(), "wa_qr.png")}\n`);
     if (!process.env.GIROSCOPIO_WA_NO_ABRIR) {
-      try {
-        spawn("cmd", ["/c", "start", "", url], { stdio: "ignore", detached: true }).unref();
-      } catch {
-        /* si no abre, la URL queda impresa */
-      }
+      // spawn avisa un ejecutable faltante con un evento "error", no con una
+      // excepcion: sin el listener, eso tiraba abajo todo el proceso.
+      spawn("cmd", ["/c", "start", "", url], { stdio: "ignore", detached: true })
+        .on("error", () => {
+          /* si no abre, la URL queda impresa */
+        })
+        .unref();
     }
+  });
+  servidorQr.on("error", (e) => {
+    console.log(`No pude abrir la pagina del QR (${e.message}). Usa el PNG: ${path.join(os.tmpdir(), "wa_qr.png")}`);
   });
 }
 
@@ -690,6 +710,9 @@ async function conectar(opts, db, estado) {
     });
     return colaCreds;
   };
+  // Para que el final del programa espere a que termine la ultima escritura
+  // (process.exit a mitad de saveCreds puede dejar creds.json cortado).
+  estado.esperarCreds = () => colaCreds;
   sock.ev.on("creds.update", (update) => {
     // El flujo por QR configura el dispositivo pero no marca registered:true
     // (el flujo por codigo si, en messages-recv.js). Lo marcamos aca para que
@@ -763,23 +786,27 @@ async function conectar(opts, db, estado) {
     estado.historialLlego = true;
   });
 
+  // Cualquier mensaje que pase mientras corre el script (uno que llega, o uno
+  // que mandaste desde el telefono) cuenta como conversacion previa.
   sock.ev.on("messages.upsert", ({ messages }) => {
     for (const m of messages) {
       const jid = m.key && m.key.remoteJid;
       if (!jid || !jid.endsWith("@s.whatsapp.net")) continue;
       const previo = db.prepare("SELECT jid FROM wa_chats WHERE jid=?").get(jid);
       if (!previo) {
-        db.prepare("INSERT INTO wa_chats(jid, nombre, ultimo_ts, origen) VALUES(?,?,?,'entrante')").run(
+        db.prepare("INSERT INTO wa_chats(jid, nombre, ultimo_ts, origen) VALUES(?,?,?,?)").run(
           jid,
-          m.pushName || null,
-          tsNum(m.messageTimestamp)
+          m.key.fromMe ? null : m.pushName || null,
+          tsNum(m.messageTimestamp),
+          m.key.fromMe ? "saliente" : "entrante"
         );
       }
     }
   });
 
+  // Se resuelve con el socket cuando la conexion queda abierta. Ante un corte
+  // se llama a conectar() de nuevo (socket nuevo) y su resultado se encadena aca.
   const abierto = new Promise((resolve, reject) => {
-    let reintentos = 0;
     const arranque = Date.now();
     const reloj = setTimeout(() => {
       reject(new Error("No se completo la vinculacion en 5 minutos. Volve a intentar."));
@@ -802,11 +829,17 @@ async function conectar(opts, db, estado) {
       }
       if (connection === "open") {
         estado.abierto = true;
+        // La corrida usa siempre estado.sock: si la conexion se cae a mitad
+        // de camino y se reconecta, sigue con el socket nuevo.
+        estado.sock = sock;
+        estado.conectado = true;
+        estado.reintentos = 0;
         marcarVinculado();
         listo(sock);
         return;
       }
       if (connection === "close") {
+        if (estado.sock === sock) estado.conectado = false;
         const codigo = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output
           ? lastDisconnect.error.output.statusCode
           : null;
@@ -872,13 +905,16 @@ async function conectar(opts, db, estado) {
           estado.sinHistorialCompleto = true;
           console.log("\nWhatsApp corto la conexion al pedir el historial completo. Reintento sin eso.");
         }
-        reintentos += 1;
-        if (reintentos > 3) {
+        // El contador vive en `estado` porque cada reintento es una llamada
+        // nueva a conectar(). Como variable local se reiniciaba en cada
+        // llamada y el limite de 3 nunca se alcanzaba (reconexion infinita).
+        estado.reintentos = (estado.reintentos || 0) + 1;
+        if (estado.reintentos > 3) {
           fallo(new Error("No se pudo reconectar con WhatsApp despues de 3 intentos."));
           return;
         }
-        console.log(`\nConexion caida (${codigo}). Reintentando ${reintentos}/3...`);
-        setTimeout(() => conectar(opts, db, estado).then(listo, fallo), 2000 * reintentos);
+        console.log(`\nConexion caida (${codigo}). Reintentando ${estado.reintentos}/3...`);
+        setTimeout(() => conectar(opts, db, estado).then(listo, fallo), 2000 * estado.reintentos);
       }
     });
   });
@@ -909,6 +945,20 @@ async function conectar(opts, db, estado) {
     await esperarHistorial(estado);
   }
   return sockListo;
+}
+
+/**
+ * El socket vivo. Si la conexion se cayo y se esta reconectando, espera hasta
+ * `ms` a que vuelva; si no vuelve, corta con un error claro en vez de seguir
+ * mandando por un socket muerto.
+ */
+async function socketActivo(estado, ms = 60000) {
+  const limite = Date.now() + ms;
+  while (!estado.conectado) {
+    if (Date.now() > limite) throw new Error("Se perdio la conexion con WhatsApp y no volvio.");
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return estado.sock;
 }
 
 function esperarHistorial(estado) {
@@ -957,34 +1007,61 @@ async function pedirCodigo(sock, numero) {
 // Cupo y rampa
 // --------------------------------------------------------------------------- #
 
+/**
+ * Cuantos mensajes quedan hoy. La rampa depende de cuantos dias ANTERIORES
+ * hubo envios: 0 dias -> 5, 1 dia -> 10, 2 o mas -> TOPE_DIA.
+ *
+ * Antes se contaba tambien el dia de hoy, asi que despues del primer envio
+ * del primer dia el techo pasaba de 5 a 10 y una segunda corrida ese mismo
+ * dia mandaba de mas (paso el 2026-11-16: 6 envios con techo de 5).
+ */
 function cupo(db, tope) {
+  const hoy = hoyIso().slice(0, 10);
   const dias = db
-    .prepare("SELECT COUNT(DISTINCT substr(fecha,1,10)) AS n FROM envios WHERE resultado='enviado'")
-    .get().n;
+    .prepare(
+      "SELECT COUNT(DISTINCT substr(fecha,1,10)) AS n FROM envios WHERE resultado='enviado' AND substr(fecha,1,10) < ?"
+    )
+    .get(hoy).n;
   const techoRampa = dias === 0 ? 5 : dias === 1 ? 10 : TOPE_DIA;
   const techo = Math.min(tope, techoRampa);
-  const hoy = hoyIso().slice(0, 10);
   const enviadosHoy = db
     .prepare("SELECT COUNT(*) AS n FROM envios WHERE resultado='enviado' AND substr(fecha,1,10)=?")
     .get(hoy).n;
   return { dias, techo, enviadosHoy, quedan: Math.max(0, techo - enviadosHoy) };
 }
 
+/**
+ * numero -> resultado mas importante que tuvo en `envios`.
+ *
+ * Un numero puede tener varias filas (simulado, error, enviado...). Antes se
+ * tomaba la primera, asi que un "simulado" o un "error" viejo tapaba un
+ * "enviado" posterior y el numero podia volver a recibir el mensaje.
+ * Ahora "enviado" siempre gana, despues "no_existe".
+ */
 function numerosVistos(db, reintentar) {
+  const prioridad = { enviado: 2, no_existe: 1 };
   const filas = db.prepare("SELECT numero, resultado FROM envios WHERE numero IS NOT NULL").all();
   const mapa = new Map();
   for (const f of filas) {
-    if (!mapa.has(f.numero)) mapa.set(f.numero, f.resultado);
+    const previo = mapa.get(f.numero);
+    if (previo === undefined || (prioridad[f.resultado] || 0) > (prioridad[previo] || 0)) {
+      mapa.set(f.numero, f.resultado);
+    }
   }
-  if (!reintentar) return mapa;
-  const limpio = new Map();
-  for (const [num, res] of mapa) if (res !== "no_existe") limpio.set(num, res);
-  return limpio;
+  // --reintentar: los "no_existe" se vuelven a consultar contra WhatsApp.
+  if (reintentar) {
+    for (const [num, res] of mapa) if (res === "no_existe") mapa.delete(num);
+  }
+  return mapa;
 }
 
 // --------------------------------------------------------------------------- #
 // Contactos
 // --------------------------------------------------------------------------- #
+
+// no_llame se carga a mano: vacio, '0', 'no' o 'false' quieren decir que se puede escribir.
+// procesar.py (_marcado) usa el mismo criterio.
+const SE_PUEDE_LLAMAR = "COALESCE(TRIM(no_llame),'') IN ('','0','no','false')";
 
 function contarSinNumero(db) {
   return db
@@ -1000,7 +1077,7 @@ function contarNoLlamar(db) {
   return db
     .prepare(
       `SELECT COUNT(*) AS n FROM negocios
-       WHERE COALESCE(TRIM(no_llame),'') NOT IN ('','0','no','false')`
+       WHERE NOT ${SE_PUEDE_LLAMAR}`
     )
     .get().n;
 }
@@ -1010,7 +1087,7 @@ function pendientes(db) {
     .prepare(
       `SELECT COUNT(*) AS n FROM negocios
        WHERE contactado=0
-         AND COALESCE(TRIM(no_llame),'') IN ('','0','no','false')
+         AND ${SE_PUEDE_LLAMAR}
          AND (COALESCE(TRIM(celular),'')<>'' OR COALESCE(TRIM(telefono_fijo),'')<>''
               OR COALESCE(TRIM(telefono_alt),'')<>'')`
     )
@@ -1021,7 +1098,7 @@ function listarContactos(db, pasada) {
   const base = `
     SELECT * FROM negocios
     WHERE contactado=0
-      AND COALESCE(TRIM(no_llame),'') IN ('','0','no','false')`;
+      AND ${SE_PUEDE_LLAMAR}`;
   const filtro =
     pasada === 1
       ? " AND COALESCE(TRIM(celular),'')<>''"
@@ -1043,6 +1120,12 @@ function imprimirEstado(db, opts) {
   const porResultado = Object.fromEntries(filas.map((f) => [f.resultado, f.n]));
   const contactados = db.prepare("SELECT COUNT(*) AS n FROM negocios WHERE contactado=1").get().n;
   const conCel = db.prepare("SELECT COUNT(*) AS n FROM negocios WHERE COALESCE(TRIM(celular),'')<>''").get().n;
+  const soloFijo = db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM negocios WHERE COALESCE(TRIM(celular),'')='' AND COALESCE(TRIM(telefono_fijo),'')<>''"
+    )
+    .get().n;
+  const chatsConocidos = db.prepare("SELECT COUNT(*) AS n FROM wa_chats").get().n;
 
   linea();
   console.log(`Base        ${path.relative(RAIZ, DB)}`);
@@ -1050,10 +1133,10 @@ function imprimirEstado(db, opts) {
   console.log(`Cupo hoy    ${c.enviadosHoy}/${c.techo}  (rampa: dia ${c.dias + 1})`);
   linea();
   console.log(`Pasada 1    ${conCel} con celular`);
-  console.log(`Pasada 2    ${db.prepare("SELECT COUNT(*) AS n FROM negocios WHERE COALESCE(TRIM(celular),'')='' AND COALESCE(TRIM(telefono_fijo),'')<>''").get().n} solo con fijo`);
+  console.log(`Pasada 2    ${soloFijo} solo con fijo`);
   console.log(`Sin numero  ${contarSinNumero(db)}`);
   console.log(`No llamar   ${contarNoLlamar(db)}`);
-  console.log(`Chats sync  ${db.prepare("SELECT COUNT(*) AS n FROM wa_chats").get().n} en wa_chats`);
+  console.log(`Chats sync  ${chatsConocidos} en wa_chats`);
   linea();
   const orden = ["enviado", "no_existe", "conversacion_previa", "duplicado", "salteado", "error", "simulado"];
   for (const k of orden) {
@@ -1111,16 +1194,14 @@ function calleDe(direccion) {
 // de la terminal suele estar apagado, asi que se usa el beep del sistema.
 function avisarListo() {
   if (process.platform === "win32") {
-    try {
-      spawn("powershell", ["-NoProfile", "-Command", "[console]::beep(880,200)"], {
-        stdio: "ignore",
-        windowsHide: true,
-        detached: true,
-      }).unref();
-      return;
-    } catch {
-      /* si falla, queda el BEL */
-    }
+    spawn("powershell", ["-NoProfile", "-Command", "[console]::beep(880,200)"], {
+      stdio: "ignore",
+      windowsHide: true,
+      detached: true,
+    })
+      .on("error", () => process.stdout.write("\x07")) // sin PowerShell: queda el BEL
+      .unref();
+    return;
   }
   process.stdout.write("\x07");
 }
@@ -1165,24 +1246,35 @@ async function correr(opts) {
   }
   const foto = faltaFoto ? null : fs.readFileSync(opts.foto);
 
+  // Estado compartido de la corrida. Lo leen y escriben correr(), conectar()
+  // (y sus reconexiones) y los handlers de eventos de Baileys.
   const estado = {
+    // contadores para el resumen
     enviados: 0,
-    hechos: 0,
+    hechos: 0, // enviados + simulados: lo que cuenta contra `objetivo`
     salteados: 0,
     previos: 0,
     inexistentes: 0,
     duplicados: 0,
-    erroresSeguidos: 0,
+    erroresSeguidos: 0, // dos seguidos cortan la corrida
+    objetivo: 0, // tope de esta corrida (cupo del dia o --limite)
+    // conexion
+    sock: null, // socket vivo; cambia si hay reconexion
+    conectado: false,
+    abierto: false, // se llego a abrir alguna vez
+    reintentos: 0, // cortes seguidos (se reinicia al abrir)
     historialLlego: false,
     sinHistorialCompleto: false,
-    abierto: false,
-    objetivo: 0,
+    esperarCreds: null, // promesa de la ultima escritura de creds
   };
 
   if (opts.probar) {
     const sock = await conectar(opts, db, estado);
-    await probar(sock, db, opts, plantilla, foto, opts.probar);
-    await cerrar(sock);
+    try {
+      await probar(sock, db, opts, plantilla, foto, opts.probar);
+    } finally {
+      await cerrar(estado.sock || sock, estado);
+    }
     return;
   }
 
@@ -1200,7 +1292,17 @@ async function correr(opts) {
   console.log(`Cupo de hoy: ${c.enviadosHoy}/${c.techo} (rampa dia ${c.dias + 1}).`);
 
   const sock = await conectar(opts, db, estado);
+  try {
+    await recorrerContactos(db, opts, estado, contactos, plantilla, foto);
+  } finally {
+    // Tambien ante un error: cierra prolijo y deja las credenciales escritas.
+    await cerrar(estado.sock || sock, estado);
+  }
+  imprimirResumen(db, estado, opts);
+}
 
+/** Recorre la lista de contactos: verifica, muestra, envia y registra. */
+async function recorrerContactos(db, opts, estado, contactos, plantilla, foto) {
   if (!estado.historialLlego) {
     console.log("\nAviso: no llego el historial de chats. No puedo saber con quien ya hablaste.");
     console.log("       Si ya usabas este WhatsApp, revisa a mano antes de seguir.\n");
@@ -1221,6 +1323,9 @@ async function correr(opts) {
       continue;
     }
 
+    // Se prueban los numeros del taller en orden (celular, fijo, alternativos)
+    // hasta que uno "resuelve" la ficha: enviado, salteado o con chat previo.
+    // Los que no tienen WhatsApp o ya se usaron pasan al siguiente.
     let resuelto = false;
     for (const cand of opciones) {
       if (resuelto) break;
@@ -1244,7 +1349,7 @@ async function correr(opts) {
       const jid = cand.num + "@s.whatsapp.net";
       let existe = false;
       try {
-        const [info] = (await sock.onWhatsApp(jid)) || [];
+        const [info] = (await (await socketActivo(estado)).onWhatsApp(jid)) || [];
         existe = Boolean(info && info.exists);
       } catch (e) {
         estado.erroresSeguidos += 1;
@@ -1282,10 +1387,7 @@ async function correr(opts) {
       );
       if (decision.accion === "salir") {
         console.log("\nCorrida interrumpida.");
-        resuelto = true;
-        await cerrar(sock);
-        imprimirResumen(db, estado, opts);
-        return;
+        return; // correr() cierra el socket e imprime el resumen
       }
       if (decision.accion === "saltear") {
         estado.salteados += 1;
@@ -1300,12 +1402,13 @@ async function correr(opts) {
         estado.hechos += 1;
       } else {
         try {
-          const enviado = await sock.sendMessage(jid, { image: foto, caption: decision.texto });
+          const activo = await socketActivo(estado);
+          const enviado = await activo.sendMessage(jid, { image: foto, caption: decision.texto });
           const id = enviado && enviado.key ? enviado.key.id : null;
-          // Cerrar el socket apenas se manda puede cortar el reintento que pide
-          // el telefono si no pudo descifrar. Esperamos el acuse de entrega.
-          const acuse = id ? await esperarAcuse(sock, id) : "sin acuse";
-          registrar(db, negocio, cand.num, jid, "enviado", acuse, id);
+          // Se registra YA, antes de esperar el acuse: si cortas con Ctrl+C
+          // durante la espera, el envio igual queda anotado y la proxima
+          // corrida no le vuelve a escribir.
+          const envioId = registrar(db, negocio, cand.num, jid, "enviado", "esperando acuse", id);
           marcarContactado(db, negocio);
           db.prepare(
             "INSERT INTO wa_chats(jid, nombre, ultimo_ts, origen) VALUES(?,?,?, 'envio') ON CONFLICT(jid) DO UPDATE SET ultimo_ts=excluded.ultimo_ts"
@@ -1314,6 +1417,10 @@ async function correr(opts) {
           estado.enviados += 1;
           estado.hechos += 1;
           estado.erroresSeguidos = 0;
+          // Cerrar el socket apenas se manda puede cortar el reintento que pide
+          // el telefono si no pudo descifrar. Esperamos el acuse de entrega.
+          const acuse = id ? await esperarAcuse(activo, id) : "sin acuse";
+          actualizarMotivo(db, envioId, acuse);
           console.log(`  enviado a +${cand.num} · ${decision.nombre} (${acuse})`);
         } catch (e) {
           estado.erroresSeguidos += 1;
@@ -1331,9 +1438,6 @@ async function correr(opts) {
       }
     }
   }
-
-  await cerrar(sock);
-  imprimirResumen(db, estado, opts);
 }
 
 async function probar(sock, db, opts, plantilla, foto, numero) {
@@ -1402,7 +1506,7 @@ function esperarAcuse(sock, id, ms = 15000) {
   });
 }
 
-async function cerrar(sock) {
+async function cerrar(sock, estado) {
   try {
     // Un respiro antes de cortar: da tiempo a que salga el ultimo reintento.
     await new Promise((r) => setTimeout(r, 2000));
@@ -1410,6 +1514,8 @@ async function cerrar(sock) {
   } catch {
     /* ya estaba cerrado */
   }
+  // Despues viene process.exit: hay que dejar terminar la escritura de creds.
+  if (estado && estado.esperarCreds) await estado.esperarCreds();
 }
 
 function imprimirResumen(db, estado, opts) {
@@ -1441,4 +1547,13 @@ if (require.main === module) {
   })();
 }
 
-module.exports = { normalizar, candidatos, limpiarNombre, renderMensaje, leerArgs, limpiarSesionIncompleta };
+module.exports = {
+  normalizar,
+  candidatos,
+  limpiarNombre,
+  renderMensaje,
+  leerArgs,
+  limpiarSesionIncompleta,
+  cupo,
+  numerosVistos,
+};
