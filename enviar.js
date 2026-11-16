@@ -69,6 +69,7 @@ function leerArgs(argv) {
     // activa a mano, y no mientras se manda.
     historialCompleto: false,
     probar: null,
+    sinValidar: false,
     numero: null,
     codigo: false,
     diagnostico: false,
@@ -92,6 +93,7 @@ function leerArgs(argv) {
       case "--forzar": opts.forzar = true; break;
       case "--historial-completo": opts.historialCompleto = true; break;
       case "--probar": opts.probar = valor(); break;
+      case "--sin-validar": opts.sinValidar = true; break;
       case "--numero": opts.numero = valor(); break;
       case "--codigo": opts.codigo = true; break;
       case "--diagnostico": opts.diagnostico = true; break;
@@ -128,12 +130,13 @@ function imprimirAyuda() {
                       Pide todo el historial al conectar. WhatsApp acepta los
                       envios pero no los entrega: sirve solo para leer chats.
   --probar NUMERO     Manda el mensaje a ese numero y termina.
+  --sin-validar       No exige que el numero de --probar sea de CABA.
   --numero NUMERO     Vincula con codigo de 8 caracteres para ese numero.
   --codigo            Igual que --numero, pero pide el numero al vuelo.
                       Sin --numero ni --codigo, vincula mostrando un QR.
   --diagnostico       Escribe wa-diag.log con todo el handshake.
 
-En el preview: Enter envia, e edita, s saltea, q sale.`);
+En el preview: Enter envia, e edita el nombre, a edita el mensaje, s saltea, q sale.`);
 }
 
 // --------------------------------------------------------------------------- #
@@ -342,12 +345,32 @@ function linea() {
   console.log("\u2500".repeat(62));
 }
 
+// Cuando la entrada es una tuberia (pruebas, scripts) se lee todo de una vez
+// y se reparte por lineas: crear un readline por pregunta pierde lo que ya
+// habia en el buffer.
+let lineasEntrada = null;
+function siguienteLinea() {
+  if (!lineasEntrada) {
+    lineasEntrada = new Promise((resolve) => {
+      let datos = "";
+      process.stdin.setEncoding("utf8");
+      process.stdin.on("data", (c) => {
+        datos += c;
+      });
+      process.stdin.on("end", () => {
+        const ls = datos.split(/\r?\n/);
+        if (ls.length && ls[ls.length - 1] === "") ls.pop();
+        resolve(ls);
+      });
+    });
+  }
+  return lineasEntrada.then((ls) => (ls.length ? ls.shift() : ""));
+}
+
 function esperarTecla(permitidas) {
   return new Promise((resolve) => {
     if (!process.stdin.isTTY) {
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      rl.question("", (resp) => {
-        rl.close();
+      siguienteLinea().then((resp) => {
         const k = String(resp || "").trim().toLowerCase();
         resolve(k === "" ? "enter" : k.slice(0, 1));
       });
@@ -378,29 +401,63 @@ function esperarTecla(permitidas) {
   });
 }
 
-async function editar(texto) {
-  const archivo = path.join(os.tmpdir(), "wa_msg.txt");
-  fs.writeFileSync(archivo, texto, "utf8");
-  const editor = process.env.EDITOR;
-  await new Promise((resolve) => {
-    // cmd.exe arma mal las comillas anidadas cuando Node le pasa el comando
-    // como argumento (error "Windows cannot find '\\'"). Con execSync el
-    // string va tal cual al shell y start /wait espera a que se cierre.
-    if (editor) {
-      const proceso = spawn(editor, [archivo], { stdio: "ignore", shell: true });
-      proceso.on("exit", resolve);
-      proceso.on("error", resolve);
-      return;
-    }
-    try {
-      execSync(`start "" /wait notepad "${archivo}"`, { stdio: "ignore" });
-    } catch {
-      /* si no hay notepad, se sigue con el texto original */
-    }
-    resolve();
+// Edicion en la misma terminal: muestra el mensaje numerado y deja cambiar,
+// agregar o borrar lineas sin abrir otro programa.
+function leerLinea(pregunta, inicial = "") {
+  if (!process.stdin.isTTY) {
+    if (pregunta) process.stdout.write(pregunta);
+    return siguienteLinea().then((v) => (String(v).trim() === "" ? inicial : String(v)));
+  }
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.setPrompt(pregunta || "");
+    rl.prompt();
+    // Deja el valor actual escrito en la linea, listo para borrar o completar.
+    if (inicial) rl.write(inicial);
+    rl.once("line", (resp) => {
+      rl.close();
+      resolve(resp.trim() === "" ? inicial : resp);
+    });
   });
-  const nuevo = fs.readFileSync(archivo, "utf8").replace(/\r\n/g, "\n").trim();
-  return nuevo || texto;
+}
+
+async function editarNombre(nombre) {
+  const nuevo = (await leerLinea("Nombre: ", nombre)).trim();
+  return nuevo || nombre;
+}
+
+async function editar(texto) {
+  const lineas = texto.split("\n");
+  for (;;) {
+    linea();
+    lineas.forEach((l, i) => console.log(`${String(i + 1).padStart(2)} | ${l}`));
+    linea();
+    const resp = (
+      await leerLinea("Linea a cambiar (Enter termina, + agrega, bN borra): ")
+    )
+      .trim()
+      .toLowerCase();
+    if (!resp) {
+      const salida = lineas.join("\n").trim();
+      return salida || texto;
+    }
+    if (resp === "+") {
+      lineas.push(await leerLinea("Nueva linea: "));
+      continue;
+    }
+    const borrar = /^b(\d+)$/.exec(resp);
+    const n = borrar ? Number(borrar[1]) : Number(resp);
+    if (!Number.isInteger(n) || n < 1 || n > lineas.length) {
+      console.log("No existe esa linea.");
+      continue;
+    }
+    if (borrar) {
+      lineas.splice(n - 1, 1);
+      continue;
+    }
+    const nuevo = await leerLinea(`Linea ${n}: `);
+    if (nuevo !== "") lineas[n - 1] = nuevo;
+  }
 }
 
 function dormir(segundos, motivo) {
@@ -1024,16 +1081,16 @@ function imprimirEstado(db, opts) {
 // Corrida
 // --------------------------------------------------------------------------- #
 
-function imprimirPreview(estado, negocio, candidato, mensaje) {
+function imprimirPreview(estado, negocio, candidato, mensaje, nombre) {
   linea();
-  console.log(`[${estado.hechos + 1}/${estado.objetivo}]  id ${negocio.id} · ${limpiarNombre(negocio.nombre) || "(sin nombre)"}`);
+  console.log(`[${estado.hechos + 1}/${estado.objetivo}]  id ${negocio.id} · ${nombre || "(sin nombre)"}`);
   const calle = calleDe(negocio.direccion);
   if (calle) console.log(calle.slice(0, 60));
   console.log(`+${candidato.num}   ${candidato.origen} · existe en WhatsApp · sin chat previo`);
   linea();
   console.log(mensaje);
   linea();
-  console.log("Enter enviar   ·   e editar   ·   s saltear   ·   q salir");
+  console.log("Enter enviar   ·   e nombre   ·   a mensaje   ·   s saltear   ·   q salir");
 }
 
 function calleDe(direccion) {
@@ -1050,13 +1107,38 @@ function calleDe(direccion) {
   return bruto;
 }
 
-async function revisar(estado, negocio, candidato, mensaje) {
-  let texto = mensaje;
+// Aviso sonoro cuando hay un mensaje listo para revisar. En Windows el BEL
+// de la terminal suele estar apagado, asi que se usa el beep del sistema.
+function avisarListo() {
+  if (process.platform === "win32") {
+    try {
+      spawn("powershell", ["-NoProfile", "-Command", "[console]::beep(880,200)"], {
+        stdio: "ignore",
+        windowsHide: true,
+        detached: true,
+      }).unref();
+      return;
+    } catch {
+      /* si falla, queda el BEL */
+    }
+  }
+  process.stdout.write("\x07");
+}
+
+async function revisar(estado, negocio, candidato, plantilla, nombreInicial) {
+  let nombre = nombreInicial;
+  let texto = renderMensaje(plantilla, nombre);
+  avisarListo();
   for (;;) {
-    imprimirPreview(estado, negocio, candidato, texto);
-    const tecla = await esperarTecla(["enter", "e", "s", "q"]);
-    if (tecla === "enter") return { accion: "enviar", texto };
+    imprimirPreview(estado, negocio, candidato, texto, nombre);
+    const tecla = await esperarTecla(["enter", "e", "a", "s", "q"]);
+    if (tecla === "enter") return { accion: "enviar", texto, nombre };
     if (tecla === "e") {
+      nombre = await editarNombre(nombre);
+      texto = renderMensaje(plantilla, nombre);
+      continue;
+    }
+    if (tecla === "a") {
       texto = await editar(texto);
       continue;
     }
@@ -1191,8 +1273,13 @@ async function correr(opts) {
         break;
       }
 
-      const mensaje = renderMensaje(plantilla, limpiarNombre(negocio.nombre));
-      const decision = await revisar(estado, negocio, cand, mensaje);
+      const decision = await revisar(
+        estado,
+        negocio,
+        cand,
+        plantilla,
+        limpiarNombre(negocio.nombre)
+      );
       if (decision.accion === "salir") {
         console.log("\nCorrida interrumpida.");
         resuelto = true;
@@ -1222,12 +1309,12 @@ async function correr(opts) {
           marcarContactado(db, negocio);
           db.prepare(
             "INSERT INTO wa_chats(jid, nombre, ultimo_ts, origen) VALUES(?,?,?, 'envio') ON CONFLICT(jid) DO UPDATE SET ultimo_ts=excluded.ultimo_ts"
-          ).run(jid, limpiarNombre(negocio.nombre) || null, Math.floor(Date.now() / 1000));
+          ).run(jid, decision.nombre || null, Math.floor(Date.now() / 1000));
           vistos.set(cand.num, "enviado");
           estado.enviados += 1;
           estado.hechos += 1;
           estado.erroresSeguidos = 0;
-          console.log(`  enviado a +${cand.num} · ${limpiarNombre(negocio.nombre)} (${acuse})`);
+          console.log(`  enviado a +${cand.num} · ${decision.nombre} (${acuse})`);
         } catch (e) {
           estado.erroresSeguidos += 1;
           registrar(db, negocio, cand.num, jid, "error", String(e.message || e).slice(0, 200));
@@ -1250,17 +1337,23 @@ async function correr(opts) {
 }
 
 async function probar(sock, db, opts, plantilla, foto, numero) {
-  const n = normalizar(numero);
-  if (!n) throw new Error("--probar necesita un numero de CABA valido.");
+  const n = opts.sinValidar
+    ? { num: soloDigitos(numero) }
+    : normalizar(numero);
+  if (!n || !n.num || n.num.length < 8) {
+    throw new Error(
+      "--probar necesita un numero valido. Si no es de CABA, sumá --sin-validar."
+    );
+  }
   const jid = n.num + "@s.whatsapp.net";
   const [info] = (await sock.onWhatsApp(jid)) || [];
   if (!info || !info.exists) console.log(`Aviso: ${n.num} no figura en WhatsApp.`);
-  const mensaje = renderMensaje(plantilla, "David (prueba)");
   const decision = await revisar(
     { hechos: 0, objetivo: 1 },
     { id: 0, nombre: "prueba", direccion: "" },
     { num: n.num, origen: "probando" },
-    mensaje
+    plantilla,
+    "David (prueba)"
   );
   if (decision.accion !== "enviar") return;
   if (opts.simular) {

@@ -75,8 +75,15 @@ medias, el script detecta la sesión incompleta y la descarta sola al arrancar.
 
 **Pantalla de revisión.** Por cada contacto: número, origen del número
 (`celular` / `fijo` / `alternativo`), el mensaje ya renderizado, y
-`Enter` enviar · `e` editar en el Bloc de notas · `s` saltear · `q` salir.
-`e` aplica solo a ese envío; la plantilla no se toca.
+`Enter` enviar · `e` editar nombre · `a` editar mensaje · `s` saltear · `q` salir.
+Los cambios aplican solo a ese envío; la plantilla no se toca.
+
+**Editar el nombre (`e`).** Abre un campo con el nombre actual ya escrito, para
+corregirlo o acortarlo. Al aceptar, el mensaje se vuelve a armar con ese nombre.
+
+**Editar el mensaje (`a`).** Muestra el mensaje numerado: escribís el número de
+línea y el texto nuevo, `+` agrega una línea al final, `bN` borra la línea N, y
+`Enter` vacío termina. Al volver se ve el mensaje corregido antes de mandarlo.
 
 **Qué manda.** Un solo mensaje con la foto y el texto como caption:
 `assets/foto.jpg` + `assets/mensaje.txt`. La plantilla usa `{nombre}`, que se
@@ -92,9 +99,11 @@ así que el mismo taller no recibe dos mensajes.
 **Conversación previa.** Al vincular, el script se queda con los chats que
 WhatsApp sincroniza (`wa_chats`). Si un número ya tiene chat, no le escribe:
 lo marca como contactado y lo informa en `--estado`. Si el historial no llegó,
-avisa antes de empezar. Si WhatsApp corta la conexión al pedir el historial
-completo (pasa con algunas cuentas), el script reintenta solo con el historial
-reciente; `--sin-historial-completo` lo evita desde el arranque.
+avisa antes de empezar.
+
+No se pide el historial completo: con esa opción WhatsApp acepta los envíos
+pero no los entrega (y a veces corta la conexión con 428). La sincronización
+normal alcanza para saber con quién ya hablaste.
 
 **Cupo.** Rampa de 5 el primer día, 10 el segundo, 30 desde el tercero
 (`--tope N` la pisa). Mínimo 60 s entre envíos. `--limite N` corta la corrida.
@@ -110,6 +119,7 @@ reciente; `--sin-historial-completo` lo evita desde el arranque.
 | `--reintentar` | Revisa de nuevo los que dieron "no existe" |
 | `--forzar` | No espera el historial al conectar |
 | `--probar NUMERO` | Envío de prueba a ese número |
+| `--sin-validar` | Permite que `--probar` use un número que no es de CABA |
 
 **Ojo:** Baileys es un cliente no oficial. Mandar mensajes a desconocidos puede
 terminar en un baneo del número; de ahí la rampa y el tope. Y como es una base
