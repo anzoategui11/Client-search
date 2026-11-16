@@ -369,11 +369,21 @@ async function editar(texto) {
   fs.writeFileSync(archivo, texto, "utf8");
   const editor = process.env.EDITOR;
   await new Promise((resolve) => {
-    const cmd = editor
-      ? spawn(editor, [archivo], { stdio: "ignore", shell: true })
-      : spawn("cmd", ["/c", `start /wait "" notepad "${archivo}"`], { stdio: "ignore" });
-    cmd.on("exit", resolve);
-    cmd.on("error", resolve);
+    // cmd.exe arma mal las comillas anidadas cuando Node le pasa el comando
+    // como argumento (error "Windows cannot find '\\'"). Con execSync el
+    // string va tal cual al shell y start /wait espera a que se cierre.
+    if (editor) {
+      const proceso = spawn(editor, [archivo], { stdio: "ignore", shell: true });
+      proceso.on("exit", resolve);
+      proceso.on("error", resolve);
+      return;
+    }
+    try {
+      execSync(`start "" /wait notepad "${archivo}"`, { stdio: "ignore" });
+    } catch {
+      /* si no hay notepad, se sigue con el texto original */
+    }
+    resolve();
   });
   const nuevo = fs.readFileSync(archivo, "utf8").replace(/\r\n/g, "\n").trim();
   return nuevo || texto;
