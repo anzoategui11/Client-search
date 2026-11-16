@@ -1,0 +1,6 @@
+node_modules/
+*.log
+
+# La sesion de WhatsApp es una credencial: nunca al repo ni a OneDrive.
+data/wa_auth/
+wa-diag.log

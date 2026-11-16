@@ -1,0 +1,24 @@
+{
+  "name": "client-search",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Releva talleres de chapa y pintura en CABA y les escribe por WhatsApp.",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning enviar.js",
+    "estado": "node --disable-warning=ExperimentalWarning enviar.js --estado",
+    "simular": "node --disable-warning=ExperimentalWarning enviar.js --simular"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "github:doryani-ai/Baileys#fix/companion-reg-refresh",
+    "qrcode": "^1.5.4"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anzoategui11/Client-search.git"
+  },
+  "license": "ISC"
+}

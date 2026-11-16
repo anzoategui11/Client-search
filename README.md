@@ -7,12 +7,14 @@ entregar un CSV con `fecha de extracción · nombre · celular · sitio web · c
 python buscar.py      # 1) descubre talleres (Google Maps, tandas de 10)
 python procesar.py    # 2) enriquece con la web de cada taller y exporta el CSV
 python marcar.py 12 15    # 3) marca los que ya llamaste
+node enviar.js        # 4) escribe por WhatsApp, uno por uno, con tu Enter
 ```
 
 ## Requisitos
 
-- Python 3.11+ (probado con 3.15, sin dependencias externas)
+- Python 3.11+ (probado con 3.15) para los pasos 1-3
 - Docker Desktop corriendo
+- Node 22.12+ (probado con 24) para el paso 4: `npm install`
 
 ## Cómo se usa
 
@@ -46,6 +48,79 @@ Opciones: `--limite 20` (prueba), `--sin-enriquecimiento`, `--refrescar-sitios`
 **3. Marcado.** El CSV trae `id` en la primera columna.
 `python marcar.py 12 15 22` los saca de las próximas exportaciones.
 `python marcar.py --estado` dice cuántos quedan pendientes.
+
+## Envío por WhatsApp (`enviar.js`)
+
+Lee `data/contactos.db` (no el CSV), verifica cada número contra el servidor de
+WhatsApp y muestra el mensaje armado para que lo mandes con Enter. Nunca manda
+solo: hay una tecla humana por mensaje.
+
+```
+node enviar.js --estado        # cupo, rampa, pendientes. No abre sesión.
+node enviar.js --simular       # recorre todo sin mandar nada
+node enviar.js --probar 54911XXXXXXXX   # un envío real a tu propio número
+node enviar.js                 # corrida real
+```
+
+**Vinculación.** La primera vez hay que vincular el dispositivo como si fuera
+WhatsApp Web. Por defecto el script abre una **página local en el navegador con el QR como
+imagen**: WhatsApp en el teléfono → Dispositivos vinculados → Vincular
+dispositivo → escanear. La página se refresca sola, así que nunca muestra un QR
+vencido; también deja el PNG en `%TEMP%\wa_qr.png` por si el navegador no abre. Con `--numero 54911XXXXXXXX` en cambio usa un
+**código de 8 caracteres** que hay que escribir en el teléfono: vence en menos
+de un minuto, así que el QR es el camino recomendado. La sesión queda en
+`%LOCALAPPDATA%\giroscopio-wa\auth` — **fuera del repo y fuera de OneDrive**,
+porque ese archivo es la credencial de tu WhatsApp. Si una vinculación queda a
+medias, el script detecta la sesión incompleta y la descarta sola al arrancar.
+
+**Pantalla de revisión.** Por cada contacto: número, origen del número
+(`celular` / `fijo` / `alternativo`), el mensaje ya renderizado, y
+`Enter` enviar · `e` editar en el Bloc de notas · `s` saltear · `q` salir.
+`e` aplica solo a ese envío; la plantilla no se toca.
+
+**Qué manda.** Un solo mensaje con la foto y el texto como caption:
+`assets/foto.jpg` + `assets/mensaje.txt`. La plantilla usa `{nombre}`, que se
+reemplaza por el nombre del negocio recortado (corta en `" - "`, saca
+`, CABA` / `, Comuna N`, tope 40 caracteres). Los dos archivos se editan con
+cualquier editor de texto.
+
+**Qué número prueba primero.** `celular`, después `telefono_fijo`, después cada
+`telefono_alt`. Todos se normalizan a `54911…` (un `+5411…` de 12 dígitos se
+convierte en su variante móvil). Se saltean los números ya vistos en `envios`,
+así que el mismo taller no recibe dos mensajes.
+
+**Conversación previa.** Al vincular, el script se queda con los chats que
+WhatsApp sincroniza (`wa_chats`). Si un número ya tiene chat, no le escribe:
+lo marca como contactado y lo informa en `--estado`. Si el historial no llegó,
+avisa antes de empezar. Si WhatsApp corta la conexión al pedir el historial
+completo (pasa con algunas cuentas), el script reintenta solo con el historial
+reciente; `--sin-historial-completo` lo evita desde el arranque.
+
+**Cupo.** Rampa de 5 el primer día, 10 el segundo, 30 desde el tercero
+(`--tope N` la pisa). Mínimo 60 s entre envíos. `--limite N` corta la corrida.
+
+| Flag | Efecto |
+|---|---|
+| `--estado` | Resumen y cupo, sin abrir sesión |
+| `--simular` | Recorre y muestra, no manda |
+| `--limite N` | Corta después de N mensajes |
+| `--pasada 1\|2` | Solo los que tienen celular (1) o solo fijo (2) |
+| `--tope N` | Techo diario |
+| `--plantilla` / `--foto` | Otros archivos |
+| `--reintentar` | Revisa de nuevo los que dieron "no existe" |
+| `--forzar` | No espera el historial al conectar |
+| `--probar NUMERO` | Envío de prueba a ese número |
+
+**Ojo:** Baileys es un cliente no oficial. Mandar mensajes a desconocidos puede
+terminar en un baneo del número; de ahí la rampa y el tope. Y como es una base
+de contactos con fines comerciales, aplica lo mismo que dice
+`## Límites conocidos` sobre las leyes 25.326 y 26.951.
+
+**Sobre la versión de Baileys.** Se instala desde la rama del PR
+[#2765](https://github.com/WhiskeySockets/Baileys/pull/2765), que arregla el
+emparejamiento por QR (WhatsApp empezó a mandar `companion_reg_refresh` el
+28/07/2026 y rc14 lo ignora). Como viene de GitHub, el `npm install` necesita
+`git`. Cuando el PR se mergee y salga una versión, se vuelve al paquete normal.
 
 ## Columnas del CSV
 
@@ -89,6 +164,9 @@ demás fichas que comparten ese número.
 | Menos de 50 celulares | normal a esta altura: hay talleres que solo publican fijo |
 | Un sitio tarda o cuelga | timeout 8 s, máximo 2 páginas por dominio, se sigue |
 | Un número quedó mal clasificado | corregilo en la base: `UPDATE negocios SET celular=... WHERE id=...` |
+| WhatsApp cierra la sesión | volvé a vincular: `node enviar.js --numero 54911XXXXXXXX` |
+| El script dice "no llegó el historial" | revisá a mano con quién ya hablaste, o corré con `--forzar` |
+| Un taller pidió no ser contactado | `UPDATE negocios SET no_llame='1' WHERE id=...` |
 
 ## Límites conocidos
 
