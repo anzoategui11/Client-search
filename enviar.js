@@ -322,6 +322,16 @@ function prepararConsola() {
       /* sin consola extendida, se sigue igual */
     }
   }
+  // libsignal imprime la sesion completa cada vez que renueva claves, justo
+  // en medio del preview. Es ruido interno y parece un error.
+  for (const nivel of ["info", "warn"]) {
+    const original = console[nivel];
+    console[nivel] = (...args) => {
+      const primero = typeof args[0] === "string" ? args[0] : "";
+      if (/^(Closing|Opening) session|^Session already (open|closed)/.test(primero)) return;
+      original.apply(console, args);
+    };
+  }
 }
 
 function linea() {
