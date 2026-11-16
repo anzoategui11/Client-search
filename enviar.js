@@ -64,7 +64,10 @@ function leerArgs(argv) {
     foto: FOTO_POR_DEFECTO,
     reintentar: false,
     forzar: false,
-    historialCompleto: true,
+    // Pedir el historial completo deja la sesion "sincronizando" y WhatsApp
+    // acepta los envios sin entregarlos (probado en esta cuenta). Solo se
+    // activa a mano, y no mientras se manda.
+    historialCompleto: false,
     probar: null,
     numero: null,
     codigo: false,
@@ -87,7 +90,7 @@ function leerArgs(argv) {
       case "--foto": opts.foto = path.resolve(valor()); break;
       case "--reintentar": opts.reintentar = true; break;
       case "--forzar": opts.forzar = true; break;
-      case "--sin-historial-completo": opts.historialCompleto = false; break;
+      case "--historial-completo": opts.historialCompleto = true; break;
       case "--probar": opts.probar = valor(); break;
       case "--numero": opts.numero = valor(); break;
       case "--codigo": opts.codigo = true; break;
@@ -121,8 +124,9 @@ function imprimirAyuda() {
   --foto ARCHIVO      Foto adjunta (default assets/foto.jpg).
   --reintentar        Incluye numeros ya marcados como inexistentes.
   --forzar            No espera el historial de chats al conectar.
-  --sin-historial-completo
-                      No pide todo el historial al vincular (si WhatsApp corta).
+  --historial-completo
+                      Pide todo el historial al conectar. WhatsApp acepta los
+                      envios pero no los entrega: sirve solo para leer chats.
   --probar NUMERO     Manda el mensaje a ese numero y termina.
   --numero NUMERO     Vincula con codigo de 8 caracteres para ese numero.
   --codigo            Igual que --numero, pero pide el numero al vuelo.
@@ -612,8 +616,9 @@ async function conectar(opts, db, estado) {
     // WhatsApp recibe un cliente que dice ser Desktop y a la vez navegador,
     // y el emparejamiento se cuelga despues del escaneo.
     browser: Browsers.ubuntu("Chrome"),
-    // Con true, WhatsApp puede cortar el handshake con 428 (probado en esta
-    // cuenta/version). Si pasa, se reintenta sin historial completo.
+    // Con true, WhatsApp acepta los envios y no los entrega (probado en esta
+    // cuenta), y ademas puede cortar el handshake con 428. Por eso va apagado
+    // salvo que se pida con --historial-completo.
     syncFullHistory: pedirHistorialCompleto,
     markOnlineOnConnect: false,
     logger,
@@ -1209,7 +1214,11 @@ async function correr(opts) {
       } else {
         try {
           const enviado = await sock.sendMessage(jid, { image: foto, caption: decision.texto });
-          registrar(db, negocio, cand.num, jid, "enviado", null, enviado && enviado.key ? enviado.key.id : null);
+          const id = enviado && enviado.key ? enviado.key.id : null;
+          // Cerrar el socket apenas se manda puede cortar el reintento que pide
+          // el telefono si no pudo descifrar. Esperamos el acuse de entrega.
+          const acuse = id ? await esperarAcuse(sock, id) : "sin acuse";
+          registrar(db, negocio, cand.num, jid, "enviado", acuse, id);
           marcarContactado(db, negocio);
           db.prepare(
             "INSERT INTO wa_chats(jid, nombre, ultimo_ts, origen) VALUES(?,?,?, 'envio') ON CONFLICT(jid) DO UPDATE SET ultimo_ts=excluded.ultimo_ts"
@@ -1218,7 +1227,7 @@ async function correr(opts) {
           estado.enviados += 1;
           estado.hechos += 1;
           estado.erroresSeguidos = 0;
-          console.log(`  enviado a +${cand.num} · ${limpiarNombre(negocio.nombre)}`);
+          console.log(`  enviado a +${cand.num} · ${limpiarNombre(negocio.nombre)} (${acuse})`);
         } catch (e) {
           estado.erroresSeguidos += 1;
           registrar(db, negocio, cand.num, jid, "error", String(e.message || e).slice(0, 200));
@@ -1259,11 +1268,51 @@ async function probar(sock, db, opts, plantilla, foto, numero) {
     return;
   }
   const enviado = await sock.sendMessage(jid, { image: foto, caption: decision.texto });
-  console.log(`  enviado. id ${enviado && enviado.key ? enviado.key.id : "?"}`);
+  const id = enviado && enviado.key ? enviado.key.id : null;
+  const acuse = id ? await esperarAcuse(sock, id) : "sin acuse";
+  console.log(`  enviado. id ${id || "?"} (${acuse})`);
+}
+
+// Espera el acuse de entrega o de lectura. Si el destinatario esta
+// desconectado no hay acuse: se sigue igual cuando vence el plazo.
+function esperarAcuse(sock, id, ms = 15000) {
+  return new Promise((resolve) => {
+    let listo = false;
+    const terminar = (valor) => {
+      if (listo) return;
+      listo = true;
+      clearTimeout(reloj);
+      sock.ev.off("messages.update", mirarEstado);
+      sock.ev.off("message-receipt.update", mirarRecibo);
+      resolve(valor);
+    };
+    const mirarEstado = (lista) => {
+      for (const u of lista) {
+        if (!u.key || u.key.id !== id) continue;
+        const estado = u.update && u.update.status;
+        if (estado === 0) return terminar("error del servidor");
+        if (estado >= 4) return terminar("leido");
+        if (estado === 3) return terminar("entregado");
+      }
+    };
+    const mirarRecibo = (lista) => {
+      for (const r of lista) {
+        if (!r.key || r.key.id !== id) continue;
+        const recibo = r.receipt || {};
+        if (recibo.readTimestamp || recibo.playedTimestamp) return terminar("leido");
+        if (recibo.receiptTimestamp) return terminar("entregado");
+      }
+    };
+    const reloj = setTimeout(() => terminar("sin acuse"), ms);
+    sock.ev.on("messages.update", mirarEstado);
+    sock.ev.on("message-receipt.update", mirarRecibo);
+  });
 }
 
 async function cerrar(sock) {
   try {
+    // Un respiro antes de cortar: da tiempo a que salga el ultimo reintento.
+    await new Promise((r) => setTimeout(r, 2000));
     sock.end(undefined);
   } catch {
     /* ya estaba cerrado */
