@@ -5,6 +5,5 @@ node_modules/
 data/wa_auth/
 wa-diag.log
 Manual.ods
-assets/foto.jpg
-assets/mensaje.txt
+assets/
 data/contactos.db

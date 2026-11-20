@@ -44,7 +44,7 @@ const AUTH = process.env.GIROSCOPIO_WA_AUTH
   : path.join(process.env.LOCALAPPDATA || os.homedir(), "giroscopio-wa", "auth");
 
 const TOPE_DIA = 30; // techo de la rampa
-const PAUSA_SEG = 60; // minimo entre envios
+const PAUSA_SEG = 30; // minimo entre envios
 const JITTER_SEG = 15; // aleatorio que se suma
 const ESPERA_HISTORIAL_MS = 15000;
 const LARGO_NOMBRE = 40;
@@ -1190,15 +1190,24 @@ function calleDe(direccion) {
   return bruto;
 }
 
-// Aviso sonoro cuando hay un mensaje listo para revisar. En Windows el BEL
-// de la terminal suele estar apagado, asi que se usa el beep del sistema.
+// Aviso sonoro cuando hay un mensaje listo para revisar. El BEL de la terminal
+// suele estar apagado y [console]::beep no suena en muchas notebooks: se
+// reproduce un wav del sistema por el dispositivo de audio.
 function avisarListo() {
   if (process.platform === "win32") {
-    spawn("powershell", ["-NoProfile", "-Command", "[console]::beep(880,200)"], {
-      stdio: "ignore",
-      windowsHide: true,
-      detached: true,
-    })
+    const wav = "C:\\Windows\\Media\\Alarm01.wav";
+    const raiz = process.env.SystemRoot || "C:\\Windows";
+    const ps = path.join(raiz, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const programa = fs.existsSync(ps) ? ps : "powershell";
+    spawn(
+      programa,
+      ["-NoProfile", "-Command", `(New-Object Media.SoundPlayer '${wav}').PlaySync()`],
+      {
+        stdio: "ignore",
+        windowsHide: true,
+        detached: true,
+      }
+    )
       .on("error", () => process.stdout.write("\x07")) // sin PowerShell: queda el BEL
       .unref();
     return;
@@ -1215,7 +1224,9 @@ async function revisar(estado, negocio, candidato, plantilla, nombreInicial) {
     const tecla = await esperarTecla(["enter", "e", "a", "s", "q"]);
     if (tecla === "enter") return { accion: "enviar", texto, nombre };
     if (tecla === "e") {
+      const anterior = nombre;
       nombre = await editarNombre(nombre);
+      console.log(nombre === anterior ? "  Sin cambios." : "  ¡Nombre cambiado!");
       texto = renderMensaje(plantilla, nombre);
       continue;
     }
@@ -1402,6 +1413,7 @@ async function recorrerContactos(db, opts, estado, contactos, plantilla, foto) {
         estado.hechos += 1;
       } else {
         try {
+          console.log("  ¡Enviando!");
           const activo = await socketActivo(estado);
           const enviado = await activo.sendMessage(jid, { image: foto, caption: decision.texto });
           const id = enviado && enviado.key ? enviado.key.id : null;
@@ -1464,6 +1476,7 @@ async function probar(sock, db, opts, plantilla, foto, numero) {
     console.log("  [simulado] no se envio nada.");
     return;
   }
+  console.log("  ¡Enviando!");
   const enviado = await sock.sendMessage(jid, { image: foto, caption: decision.texto });
   const id = enviado && enviado.key ? enviado.key.id : null;
   const acuse = id ? await esperarAcuse(sock, id) : "sin acuse";

@@ -106,7 +106,7 @@ pero no los entrega (y a veces corta la conexión con 428). La sincronización
 normal alcanza para saber con quién ya hablaste.
 
 **Cupo.** Rampa de 5 el primer día, 10 el segundo, 30 desde el tercero
-(`--tope N` la pisa). Mínimo 60 s entre envíos. `--limite N` corta la corrida.
+(`--tope N` la pisa). Mínimo 30 s entre envíos. `--limite N` corta la corrida.
 
 | Flag | Efecto |
 |---|---|
